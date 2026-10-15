@@ -1,0 +1,30 @@
+---
+name: crawl-awb-fetch
+description: How to fetch/check AWB (airway bill / shipping label PDF) for an order on Lazada, Shopee V2, TikTok, Zalora, or Mirakl — a multi-step flow (request → poll → download) that differs a lot per platform, verified against real request-maker-v5 + crawler-v3-golang source. Use for "get AWB for order X", "download shipping label", "check if this order can get AWB". Not for return/order detail (crawl-order-info-fetch), transaction (crawl-transaction-fetch), or listing (crawl-listing-fetch). Requires platform_id and shopfe_id to be given up front — this plugin has no database access to resolve them.
+---
+
+# Fetch AWB (shipping label)
+
+This plugin has **no database access** — `platform_id` (or platform domain) and `shopfe_id` must be given by the caller up front. Ask if missing; don't guess.
+
+**Some steps in this flow create real state on the marketplace (e.g. Shopee's `create_shipping_document`, Zalora/Lazada/TikTok's own equivalents) — they are not read-only.** Confirm with the caller before making one of these calls, the same way you would before any other write action. A plain "check if AWB exists" or "fetch raw order data" request is read-only and needs no confirmation; a request to actually generate/create an AWB does.
+
+1. **Fetch order/package detail first** (`get_orders_items`) — every platform's AWB endpoint needs identifiers that only show up in the item-level order response (package_id, order_item_id, tracking_number, per-item status), not just the order number. This also doubles as the eligibility check before spending a call on the AWB endpoint itself.
+   ```
+   python3 ${CLAUDE_PLUGIN_ROOT}/scripts/fetch_crawl_data.py \
+     --env dev|staging|prod \
+     --platform-id <platformId> --shop-id <shopfeId> \
+     --request-type get_orders_items --params '{"scOrderNumber": ["<orderId>"]}'
+   ```
+   Every AWB-flow step below (`get_tracking_number`, `create_shipping_document`, `get_order_document`, `get_documents`, etc.) goes through the same script — swap `--request-type`/`--params` per step.
+
+2. **Follow the platform-specific flow** — read `references/awb-flow-matrix.md` for the full verified detail (exact endpoints, param shapes, response fields, real gotchas hit in production). Don't guess these from the function names; they vary more than they look:
+   - **Shopee V2**: `get_tracking_number` (optional) → `create_shipping_document` → `get_shipping_document_result` (poll `READY`) → `download_shipping_document`. All 4 steps go through `fetch_crawl_data.py`. **`scOrderNumber` needs a trailing `|` even with an empty type** (`"orderSn|"`) — omitting it causes a request-maker-v5 HTTP 500, not a real API error. AWB creation works regardless of RTS/pickup status.
+   - **TikTok**: `get_order_document` (`scOrderNumber: "packageId|documentType|orderId"`) → response `doc_url` (temp signed URL, ~1h) → **raw GET on `doc_url` directly** (this step is NOT reachable via `fetch_crawl_data.py` — it bypasses request-maker-v5 entirely in production too). The crawler only calls this after RTS (`display_status == AWAITING_COLLECTION`), but that's just its own heuristic for the regular sync pipeline — verified empirically it's also **not a universal API restriction**: it depends on `delivery_option_name` — `Instant` orders can get a `doc_url` even before RTS, but e.g. `Same day` orders get rejected with a real API error (`code 21042104`, "Documents couldn't be printed before shipped") until shipping is arranged. Don't assume either behavior without checking the order's `delivery_option_name` first.
+   - **Lazada**: `get_order_document` (`scOrderItemNumberMap: {orderId: [packageId,...]}`, `auxiliary: [labelType]`) → for `shippingLabel` (default), response `pdf_url` needs the same raw-GET bypass as TikTok's `doc_url`; for `invoice`/`shippingLabelAndPickList`, response is base64 content already (no separate download step, but the latter is base64 **HTML**, not PDF).
+   - **Zalora**: `get_documents` → returns a `uuid` job id (not a document) → poll `get_filemanager_status` until `processStatus` isn't pending → `get_filemanager` (downloads raw bytes **through** request-maker-v5, unlike TikTok/Lazada). Most complex of the 4 — genuinely async.
+   - **Mirakl**: `get_shipment_info` (tracking/carrier info, precursor step — plays the same role `get_orders_items` does for the other platforms) → `download_shipping_document`. **Response is a base64-encoded ZIP, not a single PDF/URL** — decode base64 to ZIP bytes first, then unzip to get each order's PDF (a batch call can return multiple orders' PDFs in one ZIP). Don't expect `%PDF-` at the start of the raw response here — check for it only after unzipping. Leave `auxiliary` unset for a fresh ad-hoc fetch (setting it to `"GET_AWB_ONE_TIME_ONLY"` enables a DB-cache dedup meant for the recurring pipeline, same pattern as Shopee's tracking-number cache).
+
+3. **Binary download step — do not use `fetch_crawl_data.py`'s default stdout for the actual PDF bytes.** It does `resp.read().decode("utf-8", errors="replace")`, which is lossy for binary content and will corrupt the PDF (hit this exact bug in production troubleshooting — looked like a server error, was actually silent corruption). Write a small one-off script instead: reuse `fetch_crawl_data.call_request_maker()` to get the `UrlStruct` (Shopee/Zalora) or do a plain `urllib.request.urlopen(doc_url)` (TikTok/Lazada's external URL), and write `resp.read()` straight to a file opened in `"wb"` mode — never `.decode()` it. Verify the result starts with `%PDF-` (and ends `%%EOF`) before treating it as valid; `qlmanage -t -s 200 -o . file.pdf` (macOS Quick Look) is a solid independent check if no PDF library is available.
+
+4. **Reply/deliver** per `crawl-data-reply` for any JSON-shaped raw data (e.g. the intermediate `doc_url`/status responses); for the actual PDF file, send it directly rather than pasting into Slack — it's binary, not "raw data" in the abridge/paraphrase sense that skill covers.

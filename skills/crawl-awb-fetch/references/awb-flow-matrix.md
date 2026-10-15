@@ -1,0 +1,70 @@
+# AWB (shipping label) flow per platform — verified against real source
+
+Verified by reading the actual code, not guessed: `request-maker-v5/app/Services/RequestTemplates/<Platform>Request*/` (builds each API call) cross-referenced with `crawler-v3-golang/cmd/worker/parsers-php/parsers/<Platform>ApiParser/*.php` (the real production orchestration — eligibility gates, polling, download). Lazada/Shopee V2/TikTok/Zalora/Mirakl are covered here; other platforms weren't verified (Qoo10 has a real AWB endpoint too — `get_required_orders_document` — but wasn't documented here, ask again if it's needed later).
+
+## Common gotcha across all 4: binary PDF content
+
+The final "download the actual PDF" step returns raw binary bytes. `fetch_crawl_data.py`'s `call_marketplace()` does `resp.read().decode("utf-8", errors="replace")` — for binary content this is **lossy and irreversible** (invalid byte sequences get replaced with U+FFFD), corrupting the PDF. Confirmed empirically on Shopee `download_shipping_document` (real bug hit twice in production troubleshooting).
+
+**Never rely on `fetch_crawl_data.py`'s stdout for the download step.** Instead, write a small one-off script that either:
+- calls `fetch_crawl_data.call_request_maker(...)` to get the `UrlStruct`, then does the marketplace HTTP call itself with `resp.read()` (no `.decode()`) and writes bytes to a file with `open(path, "wb")` — for Shopee/Zalora, where the download itself goes through request-maker-v5; or
+- does a plain `urllib.request.urlopen(doc_url_or_pdf_url).read()` (no `.decode()`) directly on the temporary signed URL — for TikTok/Lazada, where the download step bypasses request-maker-v5 entirely (see below).
+
+Verify the result starts with `%PDF-` and ends with `%%EOF` before treating it as valid (that's exactly what the real crawler does via `MinerHelper::CheckValidPDF`/`StartsWith`/`EndsWith`). `qlmanage -t` (macOS Quick Look thumbnail) is a good independent validity check if no PDF library is available.
+
+## Shopee V2
+
+Source: `ShopeeRequestV2_GetOrder.php` (request-maker-v5), `ShopeeApiV2Parser_GetOrder.php` (crawler).
+
+1. `get_tracking_number` (GET `/api/v2/logistics/get_tracking_number`) — optional/informational. For Instant/SPX orders `tracking_number` can be empty with a `pickup_code` instead; this does NOT block the next step.
+2. `create_shipping_document` (POST `/api/v2/logistics/create_shipping_document`) — creates the AWB generation task. `scOrderNumber` format: `"trackingNumber|orderSn"` (empty trackingNumber before the pipe is fine — verified working with Instant orders that had no tracking number at all).
+3. `get_shipping_document_result` (POST `/api/v2/logistics/get_shipping_document_result`) — poll until `status == "READY"`. `scOrderNumber` here is just `[orderSn, ...]`, no pipe needed.
+4. `download_shipping_document` (POST `/api/v2/logistics/download_shipping_document`) — downloads the PDF. `scOrderNumber` format: **`"orderSn|shippingDocumentType"`** — **the pipe is required even with an empty type** (`"orderSn|"`). Omitting it causes `explode("|", $order)[1]` to be an undefined array index in `request-maker-v5`, surfaced as a generic **HTTP 500** (not a binary-response-handling issue — verified by reading `make_download_shipping_document` line by line after two reproducible 500s).
+
+**AWB creation is NOT gated by pickup/RTS status** — `create_shipping_document` succeeds even for orders not yet picked up, and even with an empty tracking number (Instant/SPX carrier). Also useful: `logistics_status` on the package (`LOGISTICS_REQUEST_CREATED`/`LOGISTICS_PICKUP_RETRY` = AWB already exists, ready immediately; `LOGISTICS_READY` = eligible but not created yet — calling `get_shipping_document_result`/`download` before `create_shipping_document` on this status returns Shopee error `logistics.shipping_document_should_print_first`). `allow_self_design_awb: true` on `package_list[]` also signals AWB is permitted.
+
+All 4 steps go through request-maker-v5 — `fetch_crawl_data.py` works for all of them, but step 4's output needs the raw-bytes workaround above.
+
+## TikTok
+
+Source: `TiktokRequest_GetOrder.php` (request-maker-v5, `make_get_order_document`), `TikTokApiParser_GetOrder.php` (crawler).
+
+1. `get_orders_items` (GET `/order/{v}/orders`, `params.scOrderNumber` = order IDs) — response's `packages[]` gives `package_id`; per-package `display_status` and `tracking_number` live on `line_items[]` (keyed by `package_id`), not on the package object itself.
+2. `get_order_document` (GET `/fulfillment/{v}/packages/{packageId}/shipping_documents`) — `scOrderNumber` format: **`"packageId|documentType|orderId"`** (request-maker only reads `keys[0]`=packageId and `keys[1]`=documentType; a 4th `|trackingNumber` segment is accepted and used by the crawler for local bookkeeping only, not sent to the API). `documentType` = `SHIPPING_LABEL` (default) or `SHIPPING_LABEL_AND_PACKING_SLIP` (shops with `awb_version == 2`). Response: `data.doc_url` — a **temporary signed URL, ~1h TTL** (`expire` query param, unix timestamp).
+3. Download `doc_url` directly with a raw GET — **this step bypasses request-maker-v5 entirely** (`crawler` calls it via `call_api_data`/`get_order_document_download_link`, which isn't a registered `make_*` method on any platform's request template — confirmed by grepping the whole `request-maker-v5` codebase, zero matches). `fetch_crawl_data.py` cannot do this step; do a plain `urllib.request.urlopen(doc_url).read()`.
+
+**Eligibility gate (`display_status == "AWAITING_COLLECTION"`, i.e. after RTS) is a crawler-side heuristic only, not a real API restriction** — verified empirically (2026-09-14): `get_order_document` returned a valid `doc_url` with `code: 0` for 3 orders still in `AWAITING_SHIPMENT` (not yet RTS'd). The crawler just skips calling it eagerly to avoid wasted API calls during normal sync; a direct manual call succeeds regardless of order status.
+
+## Lazada
+
+Source: `LazadaRequest_GetOrder.php` (request-maker-v5, `make_get_order_document`), `LazadaApiParser_GetOrder.php` (crawler).
+
+1. `get_orders_items` — gives `order_item_status_id.name`, `package_number`, `tracking_number`, `shipment_type_id.name`, `delivery_type_id.name` per item.
+2. `get_order_document` (GET) — input shape is a **map**, not a flat array: `scOrderItemNumberMap: {orderId: [packageId, ...]}` (for AWB) or `{orderId: [orderItemId, ...]}` (for invoice/pick-list — different id type per label type). `auxiliary` = `[labelType]` (`labelType` defaults to `'shippingLabel'` if omitted). Three label types (constants in `LazadaRequest.php`):
+   - `shippingLabel` (default, `AWB_SHIPPING_LABEL`) → API `/order/package/document/get`, **one call per package_id**, params `getDocumentReq: {doc_type: "PDF", packages: [{package_id: "..."}]}`. Response: `result.data.pdf_url` (an `https://` URL — must be downloaded separately, same bypass pattern as TikTok's `doc_url`, via `get_order_document_download_link`/raw GET, **not** through request-maker-v5).
+   - `invoice` (`INVOICE_LABEL`) → API `/order/document/get`, params `doc_type: "invoice"`, `order_item_ids` (comma-joined string). Response: `data.document.file` — **base64-encoded HTML** (`mime_type: "text/html"`), not a PDF — store/decode directly, no separate download step. Not available for `lazada.com.ph` (local policy, error `E035`).
+   - `shippingLabelAndPickList` (`AWB_SHIPPING_LABEL_AND_PICK_LIST`, shops with `awb_version == 2`) → same `/order/document/get` endpoint as invoice but `doc_type: "shippingLabel"`; response `file` is base64 HTML that the crawler converts to PDF locally (`convertHTMLToPDF`) — not something `fetch_crawl_data.py` can replicate as-is, would need local HTML→PDF conversion.
+
+**Crawler eligibility gate**: order item status in `[PACKED, REPACKED, RTS, RTS_PENDING]` AND has a `package_number` AND `shipment_type_id.name == DROP_SHIPPING` AND `delivery_type_id.name != SELLER_OWN_FLEET`. **Not yet verified empirically** whether Lazada's real API enforces this or it's crawler-only optimization like TikTok's — check by calling `get_order_document` directly on an ineligible order before assuming either way.
+
+## Zalora
+
+Source: `ZaloraRequest_GetOrder.php` (request-maker-v5), `ZaloraApiParser_GetOrder.php` (crawler). By far the most complex — a real async job, not a single call.
+
+1. `get_orders_items` — gives per-item `status` and `shipment.trackingCode`.
+2. `get_documents` (POST `/v2/orders/export-document`) — input `scOrderItemNumberMap: {orderId: [orderItemId, ...]}`, `auxiliary: [documentType, getAwbTime, formatType]` (2nd/3rd elements optional — pass `""` and omit for a fresh fetch). `documentType` constants (`ZaloraApiParser.php`): `shippingLabel` (default), `shippingLabel_SizeA6` (shops with `awb_version == 2` — actually still sent to the API as `shippingLabel` with `pageSize` set to the A6 constant), `invoice`. Response: `{uuid: "..."}` — a **background job id**, not a document yet.
+3. Poll `get_filemanager_status` (GET `/filemanager/v1/files/{uuid}/status`) — `auxiliary` is a map `{orderId: uuid}`. Check `processStatus`; stop retrying only on `ERROR`/`EXPIRED`/`CANCELED` (`AWB_STATUS_NO_NEED_TO_RETRY`) — any other value means keep polling (crawler sleeps `SLEEP_GET_STATUS_FILEMANAGER = 3s` between polls). The actual "done/ready" status string wasn't captured in this pass — infer it as "anything not in the no-retry list and not still pending" or check a real response.
+4. `get_filemanager` (GET `/filemanager/v1/files/download/{uuid}`, `is_download: true` on the request template — meaning **request-maker-v5 itself streams the raw file back in this call**, unlike TikTok/Lazada's external `doc_url`/`pdf_url` pattern). This step *is* reachable through `fetch_crawl_data.py`, but still needs the raw-bytes workaround from the top of this doc — its response is raw PDF bytes, not JSON.
+
+There's also an older, simpler-looking pair — `make_get_order_shipping_label` / `make_get_order_invoice` (GET, `api_name: "GetDocument"`, API v1, params `OrderItemIds` + `DocumentType`) — but **no crawler orchestration calls these** (grepped `ZaloraApiParser/*.php`, zero references). They may be legacy/unused; don't assume they still work without testing first.
+
+**Crawler eligibility gate**: order item `status` in `[PENDING, RTS, SHIPPED]` AND has a non-empty `shipment.trackingCode`. Not verified empirically whether the real API enforces this independently.
+
+## Mirakl
+
+Source: `MiraklRequest_GetOrders.php` (request-maker-v5), `MiraklApiParser_GetOrders.php` (crawler). Both steps below are actually used by production (`parse_get_orders`/`parse_get_order` call `parse_download_shipping_document` per their own docblocks; `parse_get_shipment_info` is called separately), unlike some of the other platforms' extra methods that turned out to be unused.
+
+1. `get_shipment_info` (GET `/api/shipments`, Mirakl ST11) — `params.scOrderNumber` (array or single value, one API call per order id — sends `order_id` singular). Response: `data[]` array of shipments, each with `tracking.carrier_code`/`carrier_name`/`tracking_number`/`tracking_url`, `shipped_date`, `status`, and `shipment_lines[]` (per `order_line_id`, `quantity`/`offer_sku`/`product_sku`). This is Mirakl's tracking/carrier info — not a PDF — use it as the precursor/eligibility-check step, same role `get_orders_items` plays for the other 4 platforms.
+2. `download_shipping_document` (GET `/api/orders/documents/download`, Mirakl OR73) — `params.scOrderNumber` (array, batched 100 via `order_ids` comma-joined). Optional `is_force_sync` (bool) and `auxiliary`: passing the literal string `"GET_AWB_ONE_TIME_ONLY"` enables a DB-cache dedup pre-check (skips orders whose AWB was already fetched before — same pattern as Shopee's tracking-number cache) unless `is_force_sync` is also true; **for a raw ad-hoc fetch, leave `auxiliary` unset** to always hit the marketplace fresh, same reasoning as the Shopee tracking-number gotcha elsewhere. `document_codes` defaults to `SYSTEM_DELIVERY_BILL` if not overridden (overriding it requires passing an object with a `document_codes` property as `auxiliary`, which conflicts with the dedup string usage above — not worth the complexity for a one-off fetch, just omit it).
+
+   **Response shape is genuinely different from every other platform here: a base64-encoded ZIP file, not a single PDF or a `pdf_url`/`doc_url`.** The ZIP can contain multiple orders' PDFs in one response (verified in `MiraklApiParser_GetOrders.php::extractPdfsFromZip`, which maps `order_id => base64 PDF` after unzipping). To get one order's PDF: base64-decode the whole response into ZIP bytes (`"wb"` mode, no `.decode()` — same binary-safety rule as the top of this doc), then unzip and pull out the PDF matching the order number. A plain single-order request will still come back wrapped in a ZIP, not a bare PDF — don't expect `%PDF-` at the start of the raw response like the other 4 platforms; check for it only after unzipping.

@@ -1,0 +1,13 @@
+{
+  "name": "pws-crawl-data-marketplace",
+  "owner": {
+    "name": "thong.bui"
+  },
+  "description": "Self-hosted marketplace for the pws-crawl-data plugin (fetch raw marketplace crawl data via request-maker-v5, no DB/MCP dependency).",
+  "plugins": [
+    {
+      "name": "pws-crawl-data",
+      "source": "./"
+    }
+  ]
+}

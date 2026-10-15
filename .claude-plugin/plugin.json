@@ -1,0 +1,9 @@
+{
+  "name": "pws-crawl-data",
+  "version": "0.1.0",
+  "description": "Fetch raw marketplace crawl data (order/listing/return/transaction/AWB) from Lazada, Shopee, TikTok, Zalora, Mirakl via request-maker-v5. No database access needed — just platform_id and shopfe_id, supplied explicitly by the caller.",
+  "author": {
+    "name": "thong.bui"
+  },
+  "skills": ["./skills/"]
+}
