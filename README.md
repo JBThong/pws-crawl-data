@@ -1,5 +1,7 @@
 # pws-crawl-data
 
+> **Internal use only.** This repo must stay **private**. It calls PowerSell's internal `request-maker-v5` gateway and references internal hostnames/IPs (see `scripts/crawl_data_config.py`, the proxy section below) — information that shouldn't be exposed on a public repo, even though an outside party couldn't actually reach that infra anyway. Don't fork or mirror this to a public host.
+
 Claude Code plugin: fetch raw marketplace crawl data (order / listing / return / transaction / AWB) from Lazada, Shopee V2, TikTok, Zalora, Mirakl — directly through `request-maker-v5`, bypassing the crawler-v3-golang/RabbitMQ pipeline.
 
 No database access, no credentials, no MCP server. Needs only:
