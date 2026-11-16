@@ -13,7 +13,7 @@ No database access, no credentials, no MCP server. Needs only:
 
 Some marketplace APIs (confirmed: Shopee, TikTok; Lazada likely too) only accept calls from a whitelisted IP. `fetch_crawl_data.py` makes the final marketplace call directly from whatever machine runs it — it does **not** go through any shared server, so each user's own machine/network needs to already be allowed, or routed through one that is. `request-maker-v5` itself is never proxied — it's an internal gateway, not whitelist-gated — only the final marketplace call needs this.
 
-On at least one working setup, this is done with a proxy at `10.11.1.6:3128` for these hosts:
+On at least one working setup, this is done with an internal proxy (`<proxy-host>:<port>` — ask whoever manages it for the real value) for these hosts:
 
 | Host | Marketplace |
 |---|---|
@@ -25,7 +25,7 @@ This was read off one person's local network-proxy tool config, not from any cen
 
 **If a call fails with something that looks like an auth/connection rejection despite correct `platform_id`/`shopfe_id`/params**, this is the first thing to check — ask whoever manages this proxy internally for the current host list and your own access. Two ways to use it once you have it:
 
-1. **Script flag/env var (recommended)** — pass `--marketplace-proxy http://10.11.1.6:3128` to `fetch_crawl_data.py`, or set `export MARKETPLACE_PROXY=http://10.11.1.6:3128` once. Scoped to just the marketplace call; the `request-maker-v5` call is unaffected either way. No other setup needed.
+1. **Script flag/env var (recommended)** — pass `--marketplace-proxy http://<proxy-host>:<port>` to `fetch_crawl_data.py`, or set `export MARKETPLACE_PROXY=http://<proxy-host>:<port>` once (put it in your shell profile, e.g. `~/.zshrc`, so it is set before you start `claude`). Scoped to just the marketplace call; the `request-maker-v5` call is unaffected either way. Note the proxy applies to every marketplace host the script calls — there is no per-host setting yet. No other setup needed.
 2. **OS-level proxy rule** — route the specific marketplace hosts above through the proxy at the network/OS level (e.g. a per-domain rule in a local proxy-manager tool). `urllib` honors this automatically with no flag needed, but it's more setup (an extra app, per-domain rules to maintain) than option 1.
 
 ## Install

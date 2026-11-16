@@ -96,7 +96,7 @@ def main():
     parser.add_argument(
         "--marketplace-proxy",
         default=os.environ.get("MARKETPLACE_PROXY"),
-        help="HTTP(S) proxy URL (e.g. http://10.11.1.6:3128) for the marketplace call only — "
+        help="HTTP(S) proxy URL (e.g. http://<proxy-host>:<port>) for the marketplace call only — "
         "some marketplaces (Shopee, TikTok, likely Lazada) require a whitelisted IP. "
         "The request-maker-v5 call is never proxied (internal gateway, not whitelist-gated).",
     )
