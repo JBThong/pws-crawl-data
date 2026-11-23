@@ -30,17 +30,28 @@ This was read off one person's local network-proxy tool config, not from any cen
 
 ## Install
 
-```bash
-claude --plugin-dir /path/to/pws-crawl-data   # one-session test, no install
-```
+### Option A — install from GitHub (recommended)
 
-Once this repo is pushed to GitHub (or any git host), it's a self-hosted marketplace — the repo's own `.claude-plugin/marketplace.json` lists itself as a plugin, so no separate marketplace repo is needed:
+This repo is private (`JBThong/pws-crawl-data`), so you need read access to it and git credentials on your machine (a GitHub Personal Access Token or SSH key — GitHub no longer accepts account passwords for git). The repo is also a self-hosted marketplace — `.claude-plugin/marketplace.json` lists itself as a plugin, so no separate marketplace repo is needed:
 
 ```bash
-claude plugin marketplace add <org>/<repo>              # GitHub shorthand
-# or: claude plugin marketplace add https://gitlab.example.com/<group>/<repo>.git
+claude plugin marketplace add JBThong/pws-crawl-data
 claude plugin install pws-crawl-data@pws-crawl-data-marketplace
 ```
+
+### Option B — run from a local folder (zip, or a git clone)
+
+Unzip (or clone) into a fixed folder, then start Claude Code with the plugin loaded:
+
+```bash
+claude --plugin-dir /path/to/pws-crawl-data
+```
+
+This only applies to that session — pass the flag every time you start `claude`.
+
+### After installing
+
+Set the marketplace proxy **before** starting `claude` if you need Shopee/TikTok (see Prerequisites above), then ask for raw data as in Usage below.
 
 ## Releasing an update
 
